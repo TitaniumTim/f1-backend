@@ -14,7 +14,7 @@ def years():
 def rounds(year: int):
     try:
         schedule = get_event_schedule(year)
-        return [{"round_name": e.name} for e in schedule]
+        return [{"round_name": e.name, "round_date": str(e.date)} for e in schedule]
     except Exception as e:
         return {"error": "Failed to fetch rounds", "details": str(e)}
 
