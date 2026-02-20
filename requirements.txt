@@ -1,6 +1,8 @@
 fastapi
 uvicorn
-fastf1
+fastf1==3.8.1
 pandas
+numpy
+matplotlib
 requests
 diskcache
