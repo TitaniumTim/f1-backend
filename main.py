@@ -1,61 +1,86 @@
 from fastapi import FastAPI
 from fastf1.events import get_event_schedule
-from fastf1.events import get_session
+import fastf1
 
 app = FastAPI()
+
+# Enable FastF1 cache (VERY important for Render)
+fastf1.Cache.enable_cache("/tmp")
 
 # Hard-coded years for dropdown
 @app.get("/years")
 def years():
     return [2023, 2024, 2025, 2026]
 
-# Get rounds (meetings) for a given year
+
+# Get rounds (race weekends) for a given year
 @app.get("/rounds")
 def rounds(year: int):
     try:
         schedule = get_event_schedule(year)
-        return [{"round_name": e.name, "round_date": str(e.date)} for e in schedule]
+
+        rounds_list = []
+        for _, row in schedule.iterrows():
+            rounds_list.append({
+                "round": int(row["RoundNumber"]),
+                "round_name": row["EventName"],
+                "country": row["Country"],
+                "location": row["Location"],
+                "event_date": str(row["EventDate"])
+            })
+
+        return rounds_list
+
     except Exception as e:
         return {"error": "Failed to fetch rounds", "details": str(e)}
 
-# Get sessions for a given round in a year
+
+# Get sessions for a given round
 @app.get("/sessions")
-def sessions(year: int, round_name: str):
+def sessions(year: int, round: int):
     try:
         schedule = get_event_schedule(year)
-        meeting = next((e for e in schedule if e.name == round_name), None)
-        if not meeting:
+
+        event = schedule[schedule["RoundNumber"] == round]
+
+        if event.empty:
             return {"error": "Round not found"}
-        return [{"session_name": s.name, "session_datetime": str(s.date)} for s in meeting.sessions]
+
+        event = event.iloc[0]
+
+        sessions_list = []
+
+        for session_name in ["Session1", "Session2", "Session3", "Session4", "Session5"]:
+            if session_name in event and event[session_name]:
+                sessions_list.append({
+                    "session_name": event[session_name]
+                })
+
+        return sessions_list
+
     except Exception as e:
         return {"error": "Failed to fetch sessions", "details": str(e)}
 
+
 # Get results for a specific session
 @app.get("/session_results")
-def session_results(year: int, round_name: str, session_name: str):
+def session_results(year: int, round: int, session: str):
     try:
-        schedule = get_event_schedule(year)
-        meeting = next((e for e in schedule if e.name == round_name), None)
-        if not meeting:
-            return {"error": "Round not found"}
+        session_obj = fastf1.get_session(year, round, session)
+        session_obj.load()
 
-        session_obj = next((s for s in meeting.sessions if s.name == session_name), None)
-        if not session_obj:
-            return {"error": "Session not found"}
+        results = session_obj.results
 
-        # Load the session results
-        session = get_session(year, meeting.name, session_obj.name)
-        session.load()  # Downloads timing/results if needed
-        results = session.results
         return [
             {
-                "position": r.Position,
-                "driver": r['Driver'],
-                "team": r['Team'],
-                "laps": r['Laps'],
-                "time": str(r['Time']),
-                "status": r['Status']
-            } for r in results.itertuples()
+                "position": int(row.Position) if row.Position else None,
+                "driver": row.FullName,
+                "team": row.TeamName,
+                "laps": row.Laps,
+                "status": row.Status
+            }
+            for _, row in results.iterrows()
         ]
+
     except Exception as e:
         return {"error": "Failed to fetch session results", "details": str(e)}
