@@ -1,82 +1,61 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import fastf1
-from fastf1.core import get_event_schedule
-import pandas as pd
+from fastapi import FastAPI
+from fastf1.events import get_event_schedule
+from fastf1.core import get_session
 
 app = FastAPI()
 
-# Allow CORS for your Vercel frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Cache FastF1 data to speed up repeated requests
-fastf1.Cache.enable_cache('f1_cache')
-
-# 1. Years endpoint
+# Hard-coded years for dropdown
 @app.get("/years")
-def get_years():
-    return {"years": [2023, 2024, 2025, 2026]}
+def years():
+    return [2023, 2024, 2025, 2026]
 
-# 2. Rounds endpoint
+# Get rounds (meetings) for a given year
 @app.get("/rounds")
-def get_rounds(year: int):
+def rounds(year: int):
     try:
-        schedule = fastf1.get_event_schedule(year)
-        rounds = []
-        for _, row in schedule.iterrows():
-            rounds.append({
-                "round": int(row['RoundNumber']),
-                "name": row['EventName'],
-                "meeting_key": row['EventName'].replace(" ", "_").lower()  # simple key
-            })
-        return {"rounds": rounds}
+        schedule = get_event_schedule(year)
+        return [{"round_name": e.name, "round_date": str(e.date)} for e in schedule]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"error": "Failed to fetch rounds", "details": str(e)}
 
-# 3. Sessions endpoint
+# Get sessions for a given round in a year
 @app.get("/sessions")
-def get_sessions(year: int, round_number: int):
+def sessions(year: int, round_name: str):
     try:
-        schedule = fastf1.get_event_schedule(year)
-        event_row = schedule[schedule['RoundNumber'] == round_number]
-        if event_row.empty:
-            raise HTTPException(status_code=404, detail="Round not found")
-        event = fastf1.get_event(year, round_number)
-        sessions = []
-        for session in ['FP1', 'FP2', 'FP3', 'Qualifying', 'Race']:
-            if session in event.sessions:
-                sess = event.get_session(session)
-                sessions.append({
-                    "name": session,
-                    "session_key": f"{year}_{round_number}_{session.lower()}"
-                })
-        return {"sessions": sessions}
+        schedule = get_event_schedule(year)
+        meeting = next((e for e in schedule if e.name == round_name), None)
+        if not meeting:
+            return {"error": "Round not found"}
+        return [{"session_name": s.name, "session_datetime": str(s.date)} for s in meeting.sessions]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"error": "Failed to fetch sessions", "details": str(e)}
 
-# 4. Session results endpoint
+# Get results for a specific session
 @app.get("/session_results")
-def get_session_results(year: int, round_number: int, session_name: str):
+def session_results(year: int, round_name: str, session_name: str):
     try:
-        event = fastf1.get_event(year, round_number)
-        session = event.get_session(session_name)
-        session.load()  # Load session telemetry + results
+        schedule = get_event_schedule(year)
+        meeting = next((e for e in schedule if e.name == round_name), None)
+        if not meeting:
+            return {"error": "Round not found"}
+
+        session_obj = next((s for s in meeting.sessions if s.name == session_name), None)
+        if not session_obj:
+            return {"error": "Session not found"}
+
+        # Load the session results
+        session = get_session(year, meeting.name, session_obj.name)
+        session.load()  # Downloads timing/results if needed
         results = session.results
-        participants = []
-        for idx, row in results.iterrows():
-            participants.append({
-                "position": int(row['Position']) if not pd.isna(row['Position']) else None,
-                "driver": str(row['Driver']),
-                "team": str(row['Team']),
-                "laps": int(row['Laps']) if not pd.isna(row['Laps']) else None,
-                "time": str(row['Time']) if 'Time' in row else None
-            })
-        return {"participants": participants}
+        return [
+            {
+                "position": r.Position,
+                "driver": r['Driver'],
+                "team": r['Team'],
+                "laps": r['Laps'],
+                "time": str(r['Time']),
+                "status": r['Status']
+            } for r in results.itertuples()
+        ]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"error": "Failed to fetch session results", "details": str(e)}
