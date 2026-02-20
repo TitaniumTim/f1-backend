@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastf1.events import get_event_schedule
-from fastf1.core import get_session
+from fastf1.events import get_session
 
 app = FastAPI()
 
