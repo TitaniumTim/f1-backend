@@ -1,6 +1,7 @@
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
+from time import sleep
 from typing import Any
 
 import pandas as pd
@@ -22,6 +23,14 @@ API_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 fastf1.Cache.enable_cache(str(CACHE_DIR))
 api_cache = Cache(str(API_CACHE_DIR))
 
+SCHEDULE_CACHE_TTL = 60 * 60 * 24 * 7
+SESSION_RESULTS_FRESH_TTL = 60 * 60
+SESSION_RESULTS_STALE_TTL = 60 * 60 * 24 * 7
+CIRCUIT_MAP_FRESH_TTL = 60 * 60 * 24
+CIRCUIT_MAP_STALE_TTL = 60 * 60 * 24 * 30
+MAX_SESSION_LOAD_ATTEMPTS = 3
+SESSION_LOAD_RETRY_DELAY_SECONDS = 1
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,7 +41,45 @@ app.add_middleware(
 
 @lru_cache(maxsize=16)
 def get_schedule(year: int):
-    return get_event_schedule(year)
+    schedule_cache_key = f"schedule:{year}"
+    try:
+        schedule = get_event_schedule(year)
+        api_cache.set(schedule_cache_key, schedule, expire=SCHEDULE_CACHE_TTL)
+        return schedule
+    except Exception:
+        cached_schedule = api_cache.get(schedule_cache_key)
+        if cached_schedule is not None:
+            return cached_schedule
+        raise
+
+
+def load_session_with_retry(
+    year: int,
+    round: int,
+    session: str,
+    *,
+    laps: bool,
+    telemetry: bool,
+    weather: bool,
+    messages: bool,
+):
+    last_error = None
+    for attempt in range(1, MAX_SESSION_LOAD_ATTEMPTS + 1):
+        try:
+            session_obj = fastf1.get_session(year, round, session)
+            session_obj.load(
+                laps=laps,
+                telemetry=telemetry,
+                weather=weather,
+                messages=messages,
+            )
+            return session_obj
+        except Exception as exc:
+            last_error = exc
+            if attempt < MAX_SESSION_LOAD_ATTEMPTS:
+                sleep(SESSION_LOAD_RETRY_DELAY_SECONDS)
+
+    raise last_error
 
 
 def parse_team_color(team_color: Any) -> str | None:
@@ -138,11 +185,16 @@ def sessions(year: int, round: int):
     return sessions_list
 
 
-@api_cache.memoize(expire=3600)
 def _load_session_results(year: int, round: int, session: str):
-    session_obj = fastf1.get_session(year, round, session)
-    # Keep this lightweight; we only need timing/results table for the game setup.
-    session_obj.load(laps=False, telemetry=False, weather=False, messages=False)
+    session_obj = load_session_with_retry(
+        year,
+        round,
+        session,
+        laps=False,
+        telemetry=False,
+        weather=False,
+        messages=False,
+    )
 
     results = session_obj.results
     return [
@@ -164,19 +216,43 @@ def _load_session_results(year: int, round: int, session: str):
 
 @app.get("/session_results")
 def session_results(year: int, round: int, session: str):
+    fresh_cache_key = f"session_results:fresh:{year}:{round}:{session}"
+    stale_cache_key = f"session_results:stale:{year}:{round}:{session}"
+
+    cached_fresh = api_cache.get(fresh_cache_key)
+    if cached_fresh is not None:
+        return cached_fresh
+
     try:
-        return _load_session_results(year, round, session)
+        response_payload = _load_session_results(year, round, session)
+        api_cache.set(
+            fresh_cache_key, response_payload, expire=SESSION_RESULTS_FRESH_TTL
+        )
+        api_cache.set(
+            stale_cache_key, response_payload, expire=SESSION_RESULTS_STALE_TTL
+        )
+        return response_payload
     except Exception as exc:
+        cached_stale = api_cache.get(stale_cache_key)
+        if cached_stale is not None:
+            return cached_stale
+
         raise HTTPException(
             status_code=502,
             detail={"error": "Failed to fetch session results", "details": str(exc)},
         ) from exc
 
 
-@api_cache.memoize(expire=86400)
 def _load_circuit_map(year: int, round: int, session: str):
-    session_obj = fastf1.get_session(year, round, session)
-    session_obj.load(laps=True, telemetry=False, weather=False, messages=False)
+    session_obj = load_session_with_retry(
+        year,
+        round,
+        session,
+        laps=True,
+        telemetry=False,
+        weather=False,
+        messages=False,
+    )
 
     lap = session_obj.laps.pick_fastest()
     if lap is None:
@@ -213,9 +289,23 @@ def _load_circuit_map(year: int, round: int, session: str):
 
 @app.get("/circuit_map")
 def circuit_map(year: int, round: int, session: str = "R"):
+    fresh_cache_key = f"circuit_map:fresh:{year}:{round}:{session}"
+    stale_cache_key = f"circuit_map:stale:{year}:{round}:{session}"
+
+    cached_fresh = api_cache.get(fresh_cache_key)
+    if cached_fresh is not None:
+        return cached_fresh
+
     try:
-        return _load_circuit_map(year, round, session)
+        response_payload = _load_circuit_map(year, round, session)
+        api_cache.set(fresh_cache_key, response_payload, expire=CIRCUIT_MAP_FRESH_TTL)
+        api_cache.set(stale_cache_key, response_payload, expire=CIRCUIT_MAP_STALE_TTL)
+        return response_payload
     except Exception as exc:
+        cached_stale = api_cache.get(stale_cache_key)
+        if cached_stale is not None:
+            return cached_stale
+
         raise HTTPException(
             status_code=502,
             detail={"error": "Failed to fetch circuit map", "details": str(exc)},
