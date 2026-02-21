@@ -3,6 +3,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 import fastf1
 from diskcache import Cache
 from fastapi import FastAPI, HTTPException
@@ -60,7 +62,7 @@ def health():
 @app.get("/years")
 def years():
     now = datetime.utcnow().year
-    return list(range(2023, now + 2))
+    return list(range(2023, now + 1))
 
 
 @app.get("/rounds")
@@ -104,19 +106,34 @@ def sessions(year: int, round: int):
 
     event = event.iloc[0]
     sessions_list = []
+    seen_sessions = set()
 
     for idx in range(1, 6):
         session_name_key = f"Session{idx}"
         session_date_key = f"Session{idx}Date"
         session_name = event.get(session_name_key)
+        session_date = event.get(session_date_key)
 
-        if session_name:
-            sessions_list.append(
-                {
-                    "session_name": session_name,
-                    "session_date": str(event.get(session_date_key)),
-                }
-            )
+        if pd.isna(session_name) or not str(session_name).strip():
+            continue
+
+        # Skip sessions that were not scheduled/confirmed in the event data.
+        if pd.isna(session_date):
+            continue
+
+        normalized_name = str(session_name).strip()
+        normalized_date = pd.Timestamp(session_date).isoformat()
+        dedupe_key = (normalized_name.lower(), normalized_date)
+        if dedupe_key in seen_sessions:
+            continue
+
+        seen_sessions.add(dedupe_key)
+        sessions_list.append(
+            {
+                "session_name": normalized_name,
+                "session_date": normalized_date,
+            }
+        )
 
     return sessions_list
 
