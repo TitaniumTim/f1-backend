@@ -97,6 +97,19 @@ def normalize_number(value: Any) -> str | None:
     return as_text if as_text else None
 
 
+
+
+def to_int_or_none(value: Any) -> int | None:
+    if value is None or pd.isna(value):
+        return None
+    return int(value)
+
+
+def to_float_or_none(value: Any) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    return float(value)
+
 def normalize_interval(value: Any) -> str | None:
     if value is None:
         return None
@@ -229,16 +242,16 @@ def _load_session_results(year: int, round: int, session: str):
 
     return [
         {
-            "position": int(row.Position) if row.Position else None,
+            "position": to_int_or_none(row.get("Position")),
             "driver": row.FullName,
             "driver_number": normalize_number(row.get("DriverNumber")),
             "driver_code": row.get("Abbreviation"),
             "team": row.TeamName,
             "team_color": parse_team_color(row.get("TeamColor")),
-            "laps": int(row.Laps) if row.Laps else None,
+            "laps": to_int_or_none(row.get("Laps")),
             "status": row.Status,
-            "grid_position": int(row.GridPosition) if row.GridPosition else None,
-            "points": float(row.Points) if row.Points is not None else None,
+            "grid_position": to_int_or_none(row.get("GridPosition")),
+            "points": to_float_or_none(row.get("Points")),
             # Timings for non-race sessions (practice / qualifying / sprint shootout)
             "lap_time": first_available_interval(row, ["Time", "Q1", "Q2", "Q3"]) if is_non_race_timed else None,
             # Timings for race sessions (race / sprint)
