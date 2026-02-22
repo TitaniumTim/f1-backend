@@ -26,6 +26,7 @@ api_cache = Cache(str(API_CACHE_DIR))
 SCHEDULE_CACHE_TTL = 60 * 60 * 24 * 7
 SESSION_RESULTS_FRESH_TTL = 60 * 60
 SESSION_RESULTS_STALE_TTL = 60 * 60 * 24 * 7
+SESSION_SNAPSHOT_VERSION = 1
 CIRCUIT_MAP_FRESH_TTL = 60 * 60 * 24
 CIRCUIT_MAP_STALE_TTL = 60 * 60 * 24 * 30
 MAX_SESSION_LOAD_ATTEMPTS = 3
@@ -252,28 +253,64 @@ def _load_session_results(year: int, round: int, session: str):
     ]
 
 
+
+
+def _session_cache_keys(year: int, round: int, session: str):
+    suffix = f"{year}:{round}:{session}"
+    return {
+        "fresh": f"session_results:fresh:{suffix}",
+        "stale": f"session_results:stale:{suffix}",
+        "snapshot": f"session_results:snapshot:v{SESSION_SNAPSHOT_VERSION}:{suffix}",
+    }
+
+
+def _update_session_result_caches(year: int, round: int, session: str, payload):
+    cache_keys = _session_cache_keys(year, round, session)
+    api_cache.set(cache_keys["fresh"], payload, expire=SESSION_RESULTS_FRESH_TTL)
+    api_cache.set(cache_keys["stale"], payload, expire=SESSION_RESULTS_STALE_TTL)
+    # Snapshot has no expiry and provides a durable best-effort fallback.
+    api_cache.set(cache_keys["snapshot"], payload)
+
+
+@app.post("/refresh_session_results")
+def refresh_session_results(year: int, round: int, session: str):
+    try:
+        response_payload = _load_session_results(year, round, session)
+        _update_session_result_caches(year, round, session, response_payload)
+        return {
+            "status": "ok",
+            "source": "upstream_refresh",
+            "results_count": len(response_payload),
+            "updated_at_utc": datetime.utcnow().isoformat() + "Z",
+            "results": response_payload,
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "Failed to refresh session results", "details": str(exc)},
+        ) from exc
+
+
 @app.get("/session_results")
 def session_results(year: int, round: int, session: str):
-    fresh_cache_key = f"session_results:fresh:{year}:{round}:{session}"
-    stale_cache_key = f"session_results:stale:{year}:{round}:{session}"
+    cache_keys = _session_cache_keys(year, round, session)
 
-    cached_fresh = api_cache.get(fresh_cache_key)
+    cached_fresh = api_cache.get(cache_keys["fresh"])
     if cached_fresh is not None:
         return cached_fresh
 
     try:
         response_payload = _load_session_results(year, round, session)
-        api_cache.set(
-            fresh_cache_key, response_payload, expire=SESSION_RESULTS_FRESH_TTL
-        )
-        api_cache.set(
-            stale_cache_key, response_payload, expire=SESSION_RESULTS_STALE_TTL
-        )
+        _update_session_result_caches(year, round, session, response_payload)
         return response_payload
     except Exception as exc:
-        cached_stale = api_cache.get(stale_cache_key)
+        cached_stale = api_cache.get(cache_keys["stale"])
         if cached_stale is not None:
             return cached_stale
+
+        cached_snapshot = api_cache.get(cache_keys["snapshot"])
+        if cached_snapshot is not None:
+            return cached_snapshot
 
         raise HTTPException(
             status_code=502,
