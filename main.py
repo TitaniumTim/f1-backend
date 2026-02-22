@@ -96,6 +96,25 @@ def normalize_number(value: Any) -> str | None:
     return as_text if as_text else None
 
 
+def normalize_interval(value: Any) -> str | None:
+    if value is None:
+        return None
+
+    if pd.isna(value):
+        return None
+
+    return str(value)
+
+
+def first_available_interval(row, fields: list[str]) -> str | None:
+    for field in fields:
+        value = row.get(field)
+        normalized = normalize_interval(value)
+        if normalized is not None:
+            return normalized
+    return None
+
+
 @app.get("/health")
 def health():
     return {
@@ -197,6 +216,16 @@ def _load_session_results(year: int, round: int, session: str):
     )
 
     results = session_obj.results
+
+    session_name = (session_obj.name or "").lower()
+    is_race_or_sprint = "race" in session_name or session_name == "sprint"
+    is_non_race_timed = (
+        "practice" in session_name
+        or "qualifying" in session_name
+        or "sprint shootout" in session_name
+        or "shootout" in session_name
+    )
+
     return [
         {
             "position": int(row.Position) if row.Position else None,
@@ -209,6 +238,15 @@ def _load_session_results(year: int, round: int, session: str):
             "status": row.Status,
             "grid_position": int(row.GridPosition) if row.GridPosition else None,
             "points": float(row.Points) if row.Points is not None else None,
+            # Timings for non-race sessions (practice / qualifying / sprint shootout)
+            "lap_time": first_available_interval(row, ["Time", "Q1", "Q2", "Q3"]) if is_non_race_timed else None,
+            # Timings for race sessions (race / sprint)
+            "race_time": first_available_interval(row, ["Time"]) if is_race_or_sprint else None,
+            "gap_to_winner": (
+                first_available_interval(row, ["GapToLeader", "Time"])
+                if is_race_or_sprint and row.get("Position") not in [1, "1"]
+                else ("0:00:00" if is_race_or_sprint and row.get("Position") in [1, "1"] else None)
+            ),
         }
         for _, row in results.iterrows()
     ]
