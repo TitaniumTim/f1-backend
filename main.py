@@ -1,86 +1,401 @@
-from fastapi import FastAPI
-from fastf1.events import get_event_schedule
+from datetime import datetime
+from functools import lru_cache
+from pathlib import Path
+from time import sleep
+from typing import Any
+
+import pandas as pd
+
 import fastf1
+from diskcache import Cache
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastf1.events import get_event_schedule
 
-app = FastAPI()
+app = FastAPI(title="F1 Top 10 Backend")
 
-# Enable FastF1 cache (VERY important for Render)
-fastf1.Cache.enable_cache("/tmp")
+CACHE_DIR = Path("/tmp/fastf1_cache")
+API_CACHE_DIR = Path("/tmp/f1_api_cache")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+API_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Hard-coded years for dropdown
+# FastF1 cache avoids repeated API calls and significantly improves warm response times.
+fastf1.Cache.enable_cache(str(CACHE_DIR))
+api_cache = Cache(str(API_CACHE_DIR))
+
+SCHEDULE_CACHE_TTL = 60 * 60 * 24 * 7
+SESSION_RESULTS_FRESH_TTL = 60 * 60
+SESSION_RESULTS_STALE_TTL = 60 * 60 * 24 * 7
+SESSION_SNAPSHOT_VERSION = 1
+CIRCUIT_MAP_FRESH_TTL = 60 * 60 * 24
+CIRCUIT_MAP_STALE_TTL = 60 * 60 * 24 * 30
+MAX_SESSION_LOAD_ATTEMPTS = 3
+SESSION_LOAD_RETRY_DELAY_SECONDS = 1
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@lru_cache(maxsize=16)
+def get_schedule(year: int):
+    schedule_cache_key = f"schedule:{year}"
+    try:
+        schedule = get_event_schedule(year)
+        api_cache.set(schedule_cache_key, schedule, expire=SCHEDULE_CACHE_TTL)
+        return schedule
+    except Exception:
+        cached_schedule = api_cache.get(schedule_cache_key)
+        if cached_schedule is not None:
+            return cached_schedule
+        raise
+
+
+def load_session_with_retry(
+    year: int,
+    round: int,
+    session: str,
+    *,
+    laps: bool,
+    telemetry: bool,
+    weather: bool,
+    messages: bool,
+):
+    last_error = None
+    for attempt in range(1, MAX_SESSION_LOAD_ATTEMPTS + 1):
+        try:
+            session_obj = fastf1.get_session(year, round, session)
+            session_obj.load(
+                laps=laps,
+                telemetry=telemetry,
+                weather=weather,
+                messages=messages,
+            )
+            return session_obj
+        except Exception as exc:
+            last_error = exc
+            if attempt < MAX_SESSION_LOAD_ATTEMPTS:
+                sleep(SESSION_LOAD_RETRY_DELAY_SECONDS)
+
+    raise last_error
+
+
+def parse_team_color(team_color: Any) -> str | None:
+    if not team_color:
+        return None
+    team_color = str(team_color).strip().lstrip("#")
+    return f"#{team_color}" if team_color else None
+
+
+def normalize_number(value: Any) -> str | None:
+    if value is None:
+        return None
+    as_text = str(value).strip()
+    return as_text if as_text else None
+
+
+
+
+def to_int_or_none(value: Any) -> int | None:
+    if value is None or pd.isna(value):
+        return None
+    return int(value)
+
+
+def to_float_or_none(value: Any) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    return float(value)
+
+def normalize_interval(value: Any) -> str | None:
+    if value is None:
+        return None
+
+    if pd.isna(value):
+        return None
+
+    return str(value)
+
+
+def first_available_interval(row, fields: list[str]) -> str | None:
+    for field in fields:
+        value = row.get(field)
+        normalized = normalize_interval(value)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "fastf1_cache": str(CACHE_DIR),
+        "api_cache_items": len(api_cache),
+        "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+    }
+
+
 @app.get("/years")
 def years():
-    return [2023, 2024, 2025, 2026]
+    now = datetime.utcnow().year
+    return list(range(2023, now + 1))
 
 
-# Get rounds (race weekends) for a given year
 @app.get("/rounds")
 def rounds(year: int):
     try:
-        schedule = get_event_schedule(year)
+        schedule = get_schedule(year)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "Failed to fetch rounds", "details": str(exc)},
+        ) from exc
 
-        rounds_list = []
-        for _, row in schedule.iterrows():
-            rounds_list.append({
+    rounds_list = []
+    filtered_schedule = schedule[schedule["RoundNumber"] > 0]
+    for _, row in filtered_schedule.iterrows():
+        rounds_list.append(
+            {
                 "round": int(row["RoundNumber"]),
                 "round_name": row["EventName"],
                 "country": row["Country"],
                 "location": row["Location"],
-                "event_date": str(row["EventDate"])
-            })
+                "event_date": str(row["EventDate"]),
+            }
+        )
 
-        return rounds_list
-
-    except Exception as e:
-        return {"error": "Failed to fetch rounds", "details": str(e)}
+    return rounds_list
 
 
-# Get sessions for a given round
 @app.get("/sessions")
 def sessions(year: int, round: int):
     try:
-        schedule = get_event_schedule(year)
+        schedule = get_schedule(year)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "Failed to fetch sessions", "details": str(exc)},
+        ) from exc
 
-        event = schedule[schedule["RoundNumber"] == round]
+    event = schedule[(schedule["RoundNumber"] == round) & (schedule["RoundNumber"] > 0)]
+    if event.empty:
+        raise HTTPException(status_code=404, detail={"error": "Round not found"})
 
-        if event.empty:
-            return {"error": "Round not found"}
+    event = event.iloc[0]
+    sessions_list = []
+    seen_sessions = set()
 
-        event = event.iloc[0]
+    for idx in range(1, 6):
+        session_name_key = f"Session{idx}"
+        session_date_key = f"Session{idx}Date"
+        session_name = event.get(session_name_key)
+        session_date = event.get(session_date_key)
 
-        sessions_list = []
+        if pd.isna(session_name) or not str(session_name).strip():
+            continue
 
-        for session_name in ["Session1", "Session2", "Session3", "Session4", "Session5"]:
-            if session_name in event and event[session_name]:
-                sessions_list.append({
-                    "session_name": event[session_name]
-                })
+        # Skip sessions that were not scheduled/confirmed in the event data.
+        if pd.isna(session_date):
+            continue
 
-        return sessions_list
+        normalized_name = str(session_name).strip()
+        normalized_date = pd.Timestamp(session_date).isoformat()
+        dedupe_key = (normalized_name.lower(), normalized_date)
+        if dedupe_key in seen_sessions:
+            continue
 
-    except Exception as e:
-        return {"error": "Failed to fetch sessions", "details": str(e)}
+        seen_sessions.add(dedupe_key)
+        sessions_list.append(
+            {
+                "session_name": normalized_name,
+                "session_date": normalized_date,
+            }
+        )
+
+    return sessions_list
 
 
-# Get results for a specific session
+def _load_session_results(year: int, round: int, session: str):
+    session_obj = load_session_with_retry(
+        year,
+        round,
+        session,
+        laps=False,
+        telemetry=False,
+        weather=False,
+        messages=False,
+    )
+
+    results = session_obj.results
+
+    session_name = (session_obj.name or "").lower()
+    is_race_or_sprint = "race" in session_name or session_name == "sprint"
+    is_non_race_timed = (
+        "practice" in session_name
+        or "qualifying" in session_name
+        or "sprint shootout" in session_name
+        or "shootout" in session_name
+    )
+
+    return [
+        {
+            "position": to_int_or_none(row.get("Position")),
+            "driver": row.FullName,
+            "driver_number": normalize_number(row.get("DriverNumber")),
+            "driver_code": row.get("Abbreviation"),
+            "team": row.TeamName,
+            "team_color": parse_team_color(row.get("TeamColor")),
+            "laps": to_int_or_none(row.get("Laps")),
+            "status": row.Status,
+            "grid_position": to_int_or_none(row.get("GridPosition")),
+            "points": to_float_or_none(row.get("Points")),
+            # Timings for non-race sessions (practice / qualifying / sprint shootout)
+            "lap_time": first_available_interval(row, ["Time", "Q1", "Q2", "Q3"]) if is_non_race_timed else None,
+            # Timings for race sessions (race / sprint)
+            "race_time": first_available_interval(row, ["Time"]) if is_race_or_sprint else None,
+            "gap_to_winner": (
+                first_available_interval(row, ["GapToLeader", "Time"])
+                if is_race_or_sprint and row.get("Position") not in [1, "1"]
+                else ("0:00:00" if is_race_or_sprint and row.get("Position") in [1, "1"] else None)
+            ),
+        }
+        for _, row in results.iterrows()
+    ]
+
+
+
+
+def _session_cache_keys(year: int, round: int, session: str):
+    suffix = f"{year}:{round}:{session}"
+    return {
+        "fresh": f"session_results:fresh:{suffix}",
+        "stale": f"session_results:stale:{suffix}",
+        "snapshot": f"session_results:snapshot:v{SESSION_SNAPSHOT_VERSION}:{suffix}",
+    }
+
+
+def _update_session_result_caches(year: int, round: int, session: str, payload):
+    cache_keys = _session_cache_keys(year, round, session)
+    api_cache.set(cache_keys["fresh"], payload, expire=SESSION_RESULTS_FRESH_TTL)
+    api_cache.set(cache_keys["stale"], payload, expire=SESSION_RESULTS_STALE_TTL)
+    # Snapshot has no expiry and provides a durable best-effort fallback.
+    api_cache.set(cache_keys["snapshot"], payload)
+
+
+@app.post("/refresh_session_results")
+def refresh_session_results(year: int, round: int, session: str):
+    try:
+        response_payload = _load_session_results(year, round, session)
+        _update_session_result_caches(year, round, session, response_payload)
+        return {
+            "status": "ok",
+            "source": "upstream_refresh",
+            "results_count": len(response_payload),
+            "updated_at_utc": datetime.utcnow().isoformat() + "Z",
+            "results": response_payload,
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "Failed to refresh session results", "details": str(exc)},
+        ) from exc
+
+
 @app.get("/session_results")
 def session_results(year: int, round: int, session: str):
+    cache_keys = _session_cache_keys(year, round, session)
+
+    cached_fresh = api_cache.get(cache_keys["fresh"])
+    if cached_fresh is not None:
+        return cached_fresh
+
     try:
-        session_obj = fastf1.get_session(year, round, session)
-        session_obj.load()
+        response_payload = _load_session_results(year, round, session)
+        _update_session_result_caches(year, round, session, response_payload)
+        return response_payload
+    except Exception as exc:
+        cached_stale = api_cache.get(cache_keys["stale"])
+        if cached_stale is not None:
+            return cached_stale
 
-        results = session_obj.results
+        cached_snapshot = api_cache.get(cache_keys["snapshot"])
+        if cached_snapshot is not None:
+            return cached_snapshot
 
-        return [
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "Failed to fetch session results", "details": str(exc)},
+        ) from exc
+
+
+def _load_circuit_map(year: int, round: int, session: str):
+    session_obj = load_session_with_retry(
+        year,
+        round,
+        session,
+        laps=True,
+        telemetry=False,
+        weather=False,
+        messages=False,
+    )
+
+    lap = session_obj.laps.pick_fastest()
+    if lap is None:
+        raise ValueError("No lap data found for this session")
+
+    pos_data = lap.get_pos_data()[["X", "Y"]]
+    track_points = [
+        {"x": float(point.X), "y": float(point.Y)} for _, point in pos_data.iterrows()
+    ]
+
+    circuit_info = session_obj.get_circuit_info()
+    corners_df = circuit_info.corners
+    corners = []
+    if corners_df is not None and not corners_df.empty:
+        corners = [
             {
-                "position": int(row.Position) if row.Position else None,
-                "driver": row.FullName,
-                "team": row.TeamName,
-                "laps": row.Laps,
-                "status": row.Status
+                "number": normalize_number(corner.get("Number")),
+                "letter": corner.get("Letter"),
+                "angle": float(corner.get("Angle")) if corner.get("Angle") else None,
+                "x": float(corner.get("X")),
+                "y": float(corner.get("Y")),
             }
-            for _, row in results.iterrows()
+            for _, corner in corners_df.iterrows()
         ]
 
-    except Exception as e:
-        return {"error": "Failed to fetch session results", "details": str(e)}
+    return {
+        "event_name": session_obj.event["EventName"],
+        "session_name": session_obj.name,
+        "rotation": float(circuit_info.rotation),
+        "track_points": track_points,
+        "corners": corners,
+    }
+
+
+@app.get("/circuit_map")
+def circuit_map(year: int, round: int, session: str = "R"):
+    fresh_cache_key = f"circuit_map:fresh:{year}:{round}:{session}"
+    stale_cache_key = f"circuit_map:stale:{year}:{round}:{session}"
+
+    cached_fresh = api_cache.get(fresh_cache_key)
+    if cached_fresh is not None:
+        return cached_fresh
+
+    try:
+        response_payload = _load_circuit_map(year, round, session)
+        api_cache.set(fresh_cache_key, response_payload, expire=CIRCUIT_MAP_FRESH_TTL)
+        api_cache.set(stale_cache_key, response_payload, expire=CIRCUIT_MAP_STALE_TTL)
+        return response_payload
+    except Exception as exc:
+        cached_stale = api_cache.get(stale_cache_key)
+        if cached_stale is not None:
+            return cached_stale
+
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "Failed to fetch circuit map", "details": str(exc)},
+        ) from exc
