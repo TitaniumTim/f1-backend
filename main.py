@@ -156,7 +156,8 @@ def rounds(year: int):
         ) from exc
 
     rounds_list = []
-    for _, row in schedule.iterrows():
+    filtered_schedule = schedule[schedule["RoundNumber"] > 0]
+    for _, row in filtered_schedule.iterrows():
         rounds_list.append(
             {
                 "round": int(row["RoundNumber"]),
@@ -180,7 +181,7 @@ def sessions(year: int, round: int):
             detail={"error": "Failed to fetch sessions", "details": str(exc)},
         ) from exc
 
-    event = schedule[schedule["RoundNumber"] == round]
+    event = schedule[(schedule["RoundNumber"] == round) & (schedule["RoundNumber"] > 0)]
     if event.empty:
         raise HTTPException(status_code=404, detail={"error": "Round not found"})
 
