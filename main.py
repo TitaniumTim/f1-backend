@@ -120,6 +120,20 @@ def normalize_interval(value: Any) -> str | None:
     return str(value)
 
 
+def format_timedelta(value: Any) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+
+    if isinstance(value, pd.Timedelta):
+        total_seconds = value.total_seconds()
+    else:
+        return normalize_interval(value)
+
+    minutes = int(total_seconds // 60)
+    seconds = total_seconds - (minutes * 60)
+    return f"{minutes}:{seconds:06.3f}"
+
+
 def first_available_interval(row, fields: list[str]) -> str | None:
     for field in fields:
         value = row.get(field)
@@ -224,7 +238,7 @@ def _load_session_results(year: int, round: int, session: str):
         year,
         round,
         session,
-        laps=False,
+        laps=True,
         telemetry=False,
         weather=False,
         messages=False,
@@ -241,9 +255,29 @@ def _load_session_results(year: int, round: int, session: str):
         or "shootout" in session_name
     )
 
+    practice_best_laps: dict[str, pd.Timedelta] = {}
+    practice_positions: dict[str, int] = {}
+    if "practice" in session_name and not session_obj.laps.empty:
+        laps = session_obj.laps[["Driver", "LapTime"]].copy()
+        laps = laps.dropna(subset=["Driver", "LapTime"])
+        if not laps.empty:
+            grouped_laps = laps.groupby("Driver", as_index=False)["LapTime"].min()
+            grouped_laps = grouped_laps.sort_values("LapTime").reset_index(drop=True)
+
+            for idx, row in grouped_laps.iterrows():
+                driver_code = row.get("Driver")
+                if not driver_code:
+                    continue
+                practice_positions[str(driver_code)] = idx + 1
+                practice_best_laps[str(driver_code)] = row.get("LapTime")
+
     return [
         {
-            "position": to_int_or_none(row.get("Position")),
+            "position": (
+                practice_positions.get(str(row.get("Abbreviation")))
+                if "practice" in session_name and to_int_or_none(row.get("Position")) is None
+                else to_int_or_none(row.get("Position"))
+            ),
             "driver": row.FullName,
             "driver_number": normalize_number(row.get("DriverNumber")),
             "driver_code": row.get("Abbreviation"),
@@ -254,7 +288,12 @@ def _load_session_results(year: int, round: int, session: str):
             "grid_position": to_int_or_none(row.get("GridPosition")),
             "points": to_float_or_none(row.get("Points")),
             # Timings for non-race sessions (practice / qualifying / sprint shootout)
-            "lap_time": first_available_interval(row, ["Time", "Q1", "Q2", "Q3"]) if is_non_race_timed else None,
+            "lap_time": (
+                first_available_interval(row, ["Time", "Q1", "Q2", "Q3"])
+                or format_timedelta(practice_best_laps.get(str(row.get("Abbreviation"))))
+                if is_non_race_timed
+                else None
+            ),
             # Timings for race sessions (race / sprint)
             "race_time": first_available_interval(row, ["Time"]) if is_race_or_sprint else None,
             "gap_to_winner": (
