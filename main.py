@@ -24,6 +24,7 @@ fastf1.Cache.enable_cache(str(CACHE_DIR))
 api_cache = Cache(str(API_CACHE_DIR))
 
 SCHEDULE_CACHE_TTL = 60 * 60 * 24 * 7
+EARLIEST_SUPPORTED_YEAR = 1950
 SESSION_RESULTS_FRESH_TTL = 60 * 60
 SESSION_RESULTS_STALE_TTL = 60 * 60 * 24 * 7
 SESSION_SNAPSHOT_VERSION = 1
@@ -43,15 +44,26 @@ app.add_middleware(
 @lru_cache(maxsize=16)
 def get_schedule(year: int):
     schedule_cache_key = f"schedule:{year}"
-    try:
-        schedule = get_event_schedule(year)
-        api_cache.set(schedule_cache_key, schedule, expire=SCHEDULE_CACHE_TTL)
-        return schedule
-    except Exception:
-        cached_schedule = api_cache.get(schedule_cache_key)
-        if cached_schedule is not None:
-            return cached_schedule
-        raise
+    errors = []
+
+    backends = [None]
+    if year < 2018:
+        # Historical seasons may only be available from Ergast.
+        backends.insert(0, "ergast")
+
+    for backend in backends:
+        try:
+            schedule = get_event_schedule(year, backend=backend)
+            api_cache.set(schedule_cache_key, schedule, expire=SCHEDULE_CACHE_TTL)
+            return schedule
+        except Exception as exc:
+            errors.append(exc)
+
+    cached_schedule = api_cache.get(schedule_cache_key)
+    if cached_schedule is not None:
+        return cached_schedule
+
+    raise errors[-1]
 
 
 def load_session_with_retry(
@@ -156,7 +168,7 @@ def health():
 @app.get("/years")
 def years():
     now = datetime.utcnow().year
-    return list(range(2023, now + 1))
+    return list(range(EARLIEST_SUPPORTED_YEAR, now + 1))
 
 
 @app.get("/rounds")
@@ -212,12 +224,8 @@ def sessions(year: int, round: int):
         if pd.isna(session_name) or not str(session_name).strip():
             continue
 
-        # Skip sessions that were not scheduled/confirmed in the event data.
-        if pd.isna(session_date):
-            continue
-
         normalized_name = str(session_name).strip()
-        normalized_date = pd.Timestamp(session_date).isoformat()
+        normalized_date = None if pd.isna(session_date) else pd.Timestamp(session_date).isoformat()
         dedupe_key = (normalized_name.lower(), normalized_date)
         if dedupe_key in seen_sessions:
             continue
